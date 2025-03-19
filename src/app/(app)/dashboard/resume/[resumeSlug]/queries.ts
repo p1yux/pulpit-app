@@ -102,39 +102,40 @@ export const getAllNotes = async (slugId: string): Promise<Note[]> => {
   }
 };
 
-export const updateNote = async (slugId: string, noteData: CreateNoteRequest | FormData): Promise<Note> => {
+export const updateNote = async (noteId: string, noteData: { note: string; note_file?: File }): Promise<Note> => {
   try {
-    if (!(noteData instanceof FormData) && noteData.note_file) {
-      const formData = new FormData();
-      Object.entries(noteData).forEach(([key, value]) => {
-        if (key === 'note_file') {
-          formData.append('note_file', value as File);
-        } else if (key === 'context' && value) {
-          formData.append('context', JSON.stringify(value));
-        } else if (value !== undefined) {
-          formData.append(key, value.toString());
+    let formData: FormData | null = null;
+    
+    if (noteData.note_file) {
+      formData = new FormData();
+      formData.append('note', noteData.note);
+      formData.append('note_file', noteData.note_file);
+      
+      const { data } = await apiClient.patch<Note>(
+        `/channels/notes/${noteId}/`,
+        formData,
+        {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          }
         }
-      });
-      noteData = formData;
+      );
+      return data;
+    } else {
+      // Simple JSON request if no file is included
+      const { data } = await apiClient.patch<Note>(
+        `/channels/notes/${noteId}/`,
+        { note: noteData.note }
+      );
+      return data;
     }
-
-    const { data } = await apiClient.post<Note>(
-      `/channels/resume/${slugId}/create-notes/`,
-      noteData,
-      noteData instanceof FormData ? {
-        headers: {
-          'Content-Type': 'multipart/form-data'
-        }
-      } : undefined
-    );
-    return data;
   } catch (error) {
     console.error('Error updating note:', error);
     throw error;
   }
 };
 
-export const deleteNote = async (slugId: string, id: string): Promise<void> => {
+export const deleteNote = async (id: string): Promise<void> => {
   try {
     await apiClient.delete(`/channels/notes/${id}/`);
   } catch (error) {

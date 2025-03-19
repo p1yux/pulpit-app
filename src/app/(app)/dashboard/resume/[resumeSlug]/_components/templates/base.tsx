@@ -16,15 +16,84 @@ import {
   updateNote as updateNoteAPI, 
   deleteNote as deleteNoteAPI,
   type Note as APINote,
-  type CreateNoteRequest 
+  type CreateNoteRequest,
+  updateResumeData as updateResumeAPI
 } from '../../queries'
+import { type Resume } from '../../../../utils'
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/esm/Page/AnnotationLayer.css';
 import 'react-pdf/dist/esm/Page/TextLayer.css';
 import { createPortal } from 'react-dom';
 
-// Initialize PDF.js worker
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.js`;
+// Add Promise.withResolvers polyfill before it's used by react-pdf
+if (typeof Promise !== 'undefined') {
+  if (!Promise.withResolvers) {
+    try {
+      // @ts-ignore: Adding polyfill for Promise.withResolvers
+      Promise.withResolvers = function() {
+        let resolve!: (value: any) => void;
+        let reject!: (reason: any) => void;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        return { promise, resolve, reject };
+      };
+      console.log('Added Promise.withResolvers polyfill successfully');
+    } catch (error) {
+      console.error('Failed to add Promise.withResolvers polyfill:', error);
+    }
+  }
+}
+
+// Initialize PDF.js worker with complete URL protocol - use a reliable CDN
+pdfjs.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+
+// Simple ErrorBoundary component for PDF rendering
+const PDFErrorBoundary: React.FC<{children: React.ReactNode}> = ({ children }) => {
+  const [hasError, setHasError] = useState(false);
+  
+  useEffect(() => {
+    // Reset error state when children change
+    setHasError(false);
+  }, [children]);
+  
+  const handleErrorEvent = (event: ErrorEvent) => {
+    if (event.error && event.error.toString().includes('withResolvers')) {
+      console.error('PDF.js error caught:', event.error);
+      setHasError(true);
+      // Prevent the error from bubbling up
+      event.preventDefault();
+    }
+  };
+  
+  useEffect(() => {
+    // Add global error handler
+    window.addEventListener('error', handleErrorEvent);
+    return () => {
+      window.removeEventListener('error', handleErrorEvent);
+    };
+  }, []);
+  
+  if (hasError) {
+    return (
+      <div className="text-center p-4 bg-red-50 rounded border border-red-200">
+        <p className="text-red-600 font-medium">There was an error loading the PDF.</p>
+        <p className="text-sm text-gray-600 mt-2">The PDF viewer encountered a compatibility issue with your browser.</p>
+        <Button 
+          variant="outline" 
+          size="sm" 
+          className="mt-3"
+          onClick={() => window.open(location.href, '_blank')}
+        >
+          <Download className="h-4 w-4 mr-2" /> Download instead
+        </Button>
+      </div>
+    );
+  }
+  
+  return <>{children}</>;
+};
 
 type BaseTemplateProps = {
   resumeData: ResumeData
@@ -196,10 +265,21 @@ export default function BaseTemplate({
   } | null>(null)
 
   const [notes, setNotes] = useState<Record<string, APINote>>(() => {
-    return initialNotes.reduce((acc, note) => ({
-      ...acc,
-      [note.identifier]: note
-    }), {})
+    console.log('Initializing notes from props:', initialNotes);
+    
+    // Make sure all initial notes have valid IDs
+    const notesMap = initialNotes.reduce((acc, note) => {
+      if (!note.id) {
+        console.warn('Initial note missing ID:', note);
+      }
+      return {
+        ...acc,
+        [note.identifier]: note
+      };
+    }, {});
+    
+    console.log('Initialized notes state with', Object.keys(notesMap).length, 'notes');
+    return notesMap;
   })
   const [selectedText, setSelectedText] = useState<{
     text: string;
@@ -252,6 +332,24 @@ export default function BaseTemplate({
     if (onDataChange) {
       onDataChange(newData)
     }
+    
+    // If we're in editable mode and have a slugId, also send the update to the server
+    if (isEditable && slugId) {
+      try {
+        console.log('Sending PATCH request to update resume data for slug:', slugId);
+        
+        updateResumeAPI(slugId, newData)
+          .then((response: Resume) => {
+            console.log('Resume data updated successfully:', response);
+          })
+          .catch((error: unknown) => {
+            console.error('Error updating resume data:', error);
+          });
+      } catch (error: unknown) {
+        console.error('Failed to update resume data:', error);
+      }
+    }
+    
     setEditingItem(null)
   }
 
@@ -268,24 +366,38 @@ export default function BaseTemplate({
     }
     
     const uiSection = uiSectionMap[title] || section
+    const isEditModeActive = editMode[internalSection]
     
     return (
       <CardHeader
-        className="flex flex-row items-center justify-between"
+        className={cn(
+          "flex flex-row items-center justify-between",
+          isEditModeActive && "bg-blue-50 border-b border-blue-100"
+        )}
       >
         <div className="flex items-center">
           <CardTitle>{title}</CardTitle>
           {isEditable && (
             <Button 
-              variant="ghost" 
+              variant={isEditModeActive ? "default" : "ghost"}
               size="sm" 
-              className="ml-2"
+              className={cn(
+                "ml-2",
+                isEditModeActive && "bg-blue-500 hover:bg-blue-600"
+              )}
               onClick={(e: React.MouseEvent) => {
                 e.stopPropagation()
                 toggleEditMode(internalSection)
               }}
             >
-              <Edit className="h-4 w-4" />
+              {isEditModeActive ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <Edit className="h-4 w-4" />
+              )}
+              {isEditModeActive && (
+                <span className="ml-1 text-xs">Editing</span>
+              )}
             </Button>
           )}
         </div>
@@ -310,37 +422,82 @@ export default function BaseTemplate({
     const links = []
 
     if (resumeData.personal_info.linkedin && resumeData.personal_info.linkedin !== '-') {
+      // Find notes for LinkedIn
+      const linkedinNotes = findNotesForItem(notes, SECTIONS.PERSONAL_INFO, 'LinkedIn', 'linkedin');
+      
       links.push(
         <a key="linkedin" href={resumeData.personal_info.linkedin} target="_blank" rel="noopener noreferrer"
-          className="flex items-center gap-1 text-gray-700 hover:underline">
+          className="flex items-center gap-1 text-gray-700 hover:underline"
+          data-section={SECTIONS.PERSONAL_INFO}
+          data-field="linkedin">
           <Linkedin className="h-4 w-4" />
-          LinkedIn
+          {linkedinNotes.length > 0 ? (
+            // If we have notes, use the HighlightedText component
+            <HighlightedText 
+              text="LinkedIn"
+              note={linkedinNotes[0]}
+              identifier={linkedinNotes[0].identifier}
+            />
+          ) : (
+            // Otherwise just render the text
+            "LinkedIn"
+          )}
         </a>
       )
     }
 
     if (resumeData.personal_info.github && resumeData.personal_info.github !== '-') {
+      // Find notes for GitHub
+      const githubNotes = findNotesForItem(notes, SECTIONS.PERSONAL_INFO, 'GitHub', 'github');
+      
       links.push(
         <a key="github" href={resumeData.personal_info.github} target="_blank" rel="noopener noreferrer"
-          className="flex items-center gap-1 text-gray-700 hover:underline">
+          className="flex items-center gap-1 text-gray-700 hover:underline"
+          data-section={SECTIONS.PERSONAL_INFO}
+          data-field="github">
           <Github className="h-4 w-4" />
-          GitHub
+          {githubNotes.length > 0 ? (
+            // If we have notes, use the HighlightedText component
+            <HighlightedText 
+              text="GitHub"
+              note={githubNotes[0]}
+              identifier={githubNotes[0].identifier}
+            />
+          ) : (
+            // Otherwise just render the text
+            "GitHub"
+          )}
         </a>
       )
     }
 
     if (resumeData.personal_info.website && resumeData.personal_info.website !== '-') {
+      // Find notes for Portfolio
+      const portfolioNotes = findNotesForItem(notes, SECTIONS.PERSONAL_INFO, 'Portfolio', 'website');
+      
       links.push(
         <a key="website" href={resumeData.personal_info.website} target="_blank" rel="noopener noreferrer"
-          className="flex items-center gap-1 text-purple-500 hover:underline">
+          className="flex items-center gap-1 text-purple-500 hover:underline"
+          data-section={SECTIONS.PERSONAL_INFO}
+          data-field="website">
           <Globe className="h-4 w-4" />
-          Portfolio
+          {portfolioNotes.length > 0 ? (
+            // If we have notes, use the HighlightedText component
+            <HighlightedText 
+              text="Portfolio"
+              note={portfolioNotes[0]}
+              identifier={portfolioNotes[0].identifier}
+            />
+          ) : (
+            // Otherwise just render the text
+            "Portfolio"
+          )}
         </a>
       )
     }
 
     return links.length > 0 ? (
-      <div className="mt-2 flex gap-4">{links}</div>
+      <div className="mt-2 flex gap-4" data-section={SECTIONS.PERSONAL_INFO}>{links}</div>
     ) : null
   }
   
@@ -436,15 +593,51 @@ export default function BaseTemplate({
       setShowTooltip(false);
       
       try {
-        await deleteNoteAPI(slugId, note.id);
-        // Remove note from state
+        // Log the exact note object for debugging
+        console.log('Attempting to delete note:', { 
+          id: note.id, 
+          identifier: note.identifier
+        });
+        
+        // First update the UI immediately for better UX
         setNotes(prev => {
           const newNotes = { ...prev };
-          delete newNotes[note.id];
+          delete newNotes[note.identifier];
+          console.log('Removed note from UI state');
           return newNotes;
         });
+        
+        // Check if note ID exists
+        if (!note.id) {
+          console.error('Note ID missing, trying to fetch it from server...');
+          try {
+            // Fetch all notes and find this note by identifier
+            const allNotes = await getAllNotes(slugId);
+            const noteWithId = allNotes.find(n => n.identifier === note.identifier);
+            
+            if (noteWithId && noteWithId.id) {
+              console.log('Found note ID from server:', noteWithId.id);
+              // Delete the note using the ID we found
+              await deleteNoteAPI(noteWithId.id);
+              console.log('Note deleted successfully with ID from server');
+            } else {
+              console.error('Could not find note ID even after fetching from server');
+            }
+          } catch (fetchError) {
+            console.error('Error fetching notes to find ID:', fetchError);
+          }
+          return;
+        }
+        
+        // If we already have the ID, delete the note directly
+        try {
+          await deleteNoteAPI(note.id);
+          console.log('Note deleted successfully with ID:', note.id);
+        } catch (error) {
+          console.error('Error deleting note from API:', error);
+        }
       } catch (error) {
-        console.error('Error deleting note:', error);
+        console.error('Error in handleDelete function:', error);
       }
     };
 
@@ -644,6 +837,10 @@ export default function BaseTemplate({
                       alt="Note attachment" 
                       className="max-w-full h-auto rounded object-contain"
                       style={{ maxHeight: '200px' }}
+                      onError={(e) => {
+                        console.error('Failed to load image:', note.note_file);
+                        e.currentTarget.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAyNCIgaGVpZ2h0PSI1MTIiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMjBweCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZpbGw9IiNjY2NjY2MiPkltYWdlIGZhaWxlZCB0byBsb2FkPC90ZXh0Pjwvc3ZnPg=='
+                      }}
                     />
                   </div>
                 )}
@@ -730,43 +927,65 @@ export default function BaseTemplate({
                     "object-contain rounded-lg",
                     isFullscreen ? "w-full h-full" : "max-w-full max-h-[calc(90vh-2rem)]"
                   )}
+                  onError={(e) => {
+                    console.error('Failed to load image in preview:', note.note_file);
+                    e.currentTarget.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAyNCIgaGVpZ2h0PSI1MTIiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMjBweCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZpbGw9IiNjY2NjY2MiPkltYWdlIGZhaWxlZCB0byBsb2FkPC90ZXh0Pjwvc3ZnPg=='
+                  }}
                 />
               ) : isPDF && (
                 <div className="flex flex-col items-center gap-4">
-                  <Document
-                    file={note.note_file}
-                    onLoadSuccess={onDocumentLoadSuccess}
-                    className="max-w-full"
-                  >
-                    <Page 
-                      pageNumber={pageNumber} 
-                      className="max-w-full shadow-lg rounded"
-                      width={isFullscreen ? window.innerWidth * 0.8 : Math.min(window.innerWidth * 0.8, 800)}
-                    />
-                  </Document>
-                  {numPages && numPages > 1 && (
-                    <div className="flex items-center gap-4 mt-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handlePrevPage}
-                        disabled={pageNumber <= 1}
-                      >
-                        Previous
-                      </Button>
-                      <p className="text-sm">
-                        Page {pageNumber} of {numPages}
-                      </p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={handleNextPage}
-                        disabled={pageNumber >= (numPages || 1)}
-                      >
-                        Next
-                      </Button>
+                  <div className="w-full max-w-full bg-white rounded-lg shadow-lg overflow-hidden">
+                    <div className="p-4 bg-gray-100 border-b flex justify-between items-center">
+                      <p className="text-sm font-medium">PDF Preview</p>
+                      <div className="flex gap-2">
+                        {numPages && numPages > 1 && (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={handlePrevPage}
+                              disabled={pageNumber <= 1}
+                            >
+                              Previous
+                            </Button>
+                            <span className="text-sm">
+                              Page {pageNumber} of {numPages}
+                            </span>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={handleNextPage}
+                              disabled={pageNumber >= (numPages || 1)}
+                            >
+                              Next
+                            </Button>
+                          </>
+                        )}
+                      </div>
                     </div>
-                  )}
+                    <div className="p-4 flex justify-center">
+                      <PDFErrorBoundary>
+                        <Document
+                          file={note.note_file}
+                          onLoadSuccess={onDocumentLoadSuccess}
+                          loading={<div className="text-center p-4 flex items-center justify-center h-[200px]"><p>Loading PDF...</p></div>}
+                          error={<div className="text-center p-4 flex items-center justify-center h-[200px] text-red-500">Failed to load PDF. <Button variant="link" size="sm" onClick={handleDownload}>Download instead</Button></div>}
+                          noData={<div className="text-center p-4 flex items-center justify-center h-[200px]">No PDF file found.</div>}
+                        >
+                          {numPages !== null && numPages > 0 && (
+                            <Page 
+                              pageNumber={pageNumber} 
+                              width={isFullscreen ? window.innerWidth * 0.7 : Math.min(window.innerWidth * 0.7, 700)}
+                              renderAnnotationLayer={false}
+                              renderTextLayer={false}
+                              loading={<div className="text-center p-4 flex items-center justify-center h-[200px]">Loading page...</div>}
+                              error={<div className="text-center p-4 flex items-center justify-center h-[200px] text-red-500">Error loading page.</div>}
+                            />
+                          )}
+                        </Document>
+                      </PDFErrorBoundary>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
@@ -835,24 +1054,24 @@ export default function BaseTemplate({
         }
 
         return (
-          <div 
+          <span 
             data-section={section}
             data-field={field}
-            className="relative inline-block"
+            className="relative inline"
           >
             {parts}
-          </div>
+          </span>
         );
       }
 
       return (
-        <div 
+        <span 
           data-section={section}
           data-field={field}
-          className="relative inline-block"
+          className="relative inline"
         >
           {value}
-        </div>
+        </span>
       );
     }
     
@@ -902,14 +1121,18 @@ export default function BaseTemplate({
     }
     
     return (
-      <div 
-        className="cursor-pointer hover:bg-gray-100 px-1 rounded inline-block"
+      <span 
+        className={cn(
+          "cursor-pointer px-1 rounded inline",
+          editMode[section] && "hover:bg-blue-100 border-b border-dashed border-blue-300",
+          !editMode[section] && "hover:bg-gray-100"
+        )}
         onClick={() => startEditing(section, index, field)}
         data-section={section}
         data-field={field}
       >
         {value}
-      </div>
+      </span>
     )
   }
   
@@ -1022,7 +1245,11 @@ export default function BaseTemplate({
     
     return (
       <span 
-        className="cursor-pointer hover:bg-gray-100 px-1 rounded"
+        className={cn(
+          "cursor-pointer px-1 rounded",
+          editMode[section] && "hover:bg-blue-100 border-b border-dashed border-blue-300",
+          !editMode[section] && "hover:bg-gray-100"
+        )}
         onClick={() => startEditing(section, itemIndex, `resp_${respIndex}`)}
       >
         {value}
@@ -1078,6 +1305,7 @@ export default function BaseTemplate({
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selectedFile, setSelectedFile] = useState<File | null>(null);
+    const [filePreview, setFilePreview] = useState<string | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -1104,22 +1332,27 @@ export default function BaseTemplate({
       }
 
       setIsSubmitting(true);
-      setIsCreatingNote(true);
       try {
         await onSave(value, selectedFile);
         setValue('');
         setSelectedFile(null);
+        setFilePreview(null);
       } catch (error) {
         console.error('Failed to save note:', error);
         setError('Failed to save note. Please try again.');
       } finally {
         setIsSubmitting(false);
-        setIsCreatingNote(false);
       }
     };
 
     const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
+      
+      // Clear the file input value to allow selecting the same file again
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+      
       if (file) {
         // Check file type
         const isImage = file.type.startsWith('image/');
@@ -1137,12 +1370,40 @@ export default function BaseTemplate({
         }
         
         setSelectedFile(file);
+        
+        // Create preview for images with error handling
+        if (isImage) {
+          try {
+            const reader = new FileReader();
+            reader.onload = (event) => {
+              if (event.target?.result) {
+                setFilePreview(event.target.result as string);
+              } else {
+                console.error('Failed to load image preview: Result is null');
+                setFilePreview(null);
+              }
+            };
+            reader.onerror = (error) => {
+              console.error('Error reading file:', error);
+              setFilePreview(null);
+              setError('Failed to preview image');
+            };
+            reader.readAsDataURL(file);
+          } catch (error) {
+            console.error('Failed to create image preview:', error);
+            setFilePreview(null);
+          }
+        } else {
+          setFilePreview(null);
+        }
+        
         setError(null);
       }
     };
 
     const handleRemoveFile = () => {
       setSelectedFile(null);
+      setFilePreview(null);
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
@@ -1176,34 +1437,69 @@ export default function BaseTemplate({
         />
         
         {/* File Upload Section */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2">
           <input
             ref={fileInputRef}
             type="file"
             accept="image/*,.pdf"
             onChange={handleFileSelect}
             className="hidden"
+            id="note-file-upload"
           />
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            Attach File
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Attach File
+            </Button>
+            <span className="text-xs text-gray-500">
+              (Images or PDF, max 5MB)
+            </span>
+          </div>
+          
           {selectedFile && (
-            <div className="flex items-center gap-2 text-sm text-gray-600">
-              <span className="truncate max-w-[150px]">{selectedFile.name}</span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={handleRemoveFile}
-                className="h-6 w-6 p-0"
-              >
-                <X className="h-4 w-4" />
-              </Button>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2 text-sm bg-gray-50 p-2 rounded border">
+                <div className="flex-1 flex items-center gap-2">
+                  {selectedFile.type.startsWith('image/') ? (
+                    <ImageIcon className="h-4 w-4 text-blue-500" />
+                  ) : (
+                    <FileIcon className="h-4 w-4 text-red-500" />
+                  )}
+                  <span className="truncate max-w-[250px]">{selectedFile.name}</span>
+                  <span className="text-xs text-gray-500">
+                    ({Math.round(selectedFile.size / 1024)} KB)
+                  </span>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleRemoveFile}
+                  className="h-6 w-6 p-0"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+              
+              {/* Image Preview */}
+              {filePreview && (
+                <div className="mt-1 max-h-[150px] overflow-hidden rounded border">
+                  <img 
+                    src={filePreview} 
+                    alt="File preview" 
+                    className="max-w-full h-auto object-contain max-h-[150px]"
+                    onError={(e) => {
+                      console.error('Failed to load preview');
+                      // Use a fallback image on error
+                      e.currentTarget.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAyNCIgaGVpZ2h0PSI1MTIiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMjBweCIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZpbGw9IiNjY2NjY2MiPkltYWdlIGZhaWxlZCB0byBsb2FkPC90ZXh0Pjwvc3ZnPg=='
+                    }}
+                  />
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1215,11 +1511,7 @@ export default function BaseTemplate({
           <Button 
             variant="outline" 
             size="sm" 
-            onClick={() => {
-              if (!isSubmitting) {
-                onCancel();
-              }
-            }} 
+            onClick={onCancel} 
             disabled={isSubmitting}
           >
             Cancel
@@ -1242,6 +1534,7 @@ export default function BaseTemplate({
     useEffect(() => {
       if (showNotePopover || editingNote) {
         setShowNotePopover(true);
+        setIsCreatingNote(true);
       }
     }, [showNotePopover, editingNote]);
 
@@ -1251,8 +1544,19 @@ export default function BaseTemplate({
       <div 
         className="fixed inset-0 bg-black/50 flex items-center justify-center"
         style={{ zIndex: 2147483645 }}
+        onClick={(e) => {
+          if (e.target === e.currentTarget) {
+            setShowNotePopover(false);
+            setIsCreatingNote(false);
+            setEditingNote(null);
+          }
+        }}
       >
-        <div className="bg-white rounded-lg shadow-lg p-4 w-[400px]">
+        <div 
+          ref={popoverRef}
+          className="bg-white rounded-lg shadow-lg p-4 w-[400px]"
+          onClick={(e) => e.stopPropagation()}
+        >
           <NoteInput 
             onSave={async (note, file) => {
               try {
@@ -1304,9 +1608,41 @@ export default function BaseTemplate({
                 />
               </span>
               {skillNotes.length > 0}
+              {editMode[SECTIONS.SKILLS] && isEditable && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-4 w-4 p-0 ml-1 text-red-500 hover:bg-red-50"
+                  onClick={() => {
+                    console.log('Deleting skill at index:', index);
+                    // Update local state immediately for better UX
+                    updateResumeData(draft => {
+                      draft.skills = draft.skills.filter((_, i) => i !== index);
+                    });
+                  }}
+                >
+                  <X className="h-3 w-3" />
+                </Button>
+              )}
             </div>
           );
         })}
+        
+        {editMode[SECTIONS.SKILLS] && isEditable && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="rounded-full bg-gray-50 border-dashed border-gray-300 hover:bg-gray-100"
+            onClick={() => {
+              console.log('Adding new skill');
+              updateResumeData(draft => {
+                draft.skills.push({ name: 'New Skill' });
+              });
+            }}
+          >
+            + Add Skill
+          </Button>
+        )}
       </div>
     );
   };
@@ -1318,8 +1654,9 @@ export default function BaseTemplate({
     }
 
     try {
+      const noteIdentifier = `${selectedText.section}-${selectedText.text}-${Date.now()}`;
       const noteData: CreateNoteRequest = {
-        identifier: `${selectedText.section}-${selectedText.text}-${Date.now()}`,
+        identifier: noteIdentifier,
         note: noteText,
         section: selectedText.section,
         selected_text: selectedText.text,
@@ -1330,6 +1667,12 @@ export default function BaseTemplate({
         } : undefined
       };
 
+      console.log('Creating note with data:', { 
+        identifier: noteIdentifier,
+        noteText,
+        hasFile: !!file
+      });
+
       let formData: FormData | null = null;
       if (file) {
         formData = new FormData();
@@ -1342,65 +1685,119 @@ export default function BaseTemplate({
         });
       }
 
-      const newNote = await createNoteAPI(slugId, formData || noteData);
+      // Call API to create note
+      console.log('Sending note creation request to API...');
+      // Create a local temporary version of the note for immediate UI feedback
+      const tempNote: APINote = {
+        id: '', // Empty ID until we get one from the server
+        identifier: noteIdentifier,
+        note: noteText,
+        section: selectedText.section,
+        selected_text: selectedText.text,
+        context: selectedText.context ? {
+          beforeText: selectedText.context.beforeText || '',
+          afterText: selectedText.context.afterText || '',
+          parentElement: selectedText.context.parentElement || ''
+        } : undefined,
+        note_file: file ? URL.createObjectURL(file) : undefined,
+        note_file_type: file?.type
+      };
       
-      // Update notes state
+      // Immediately update UI with temporary note
       setNotes(prev => ({
         ...prev,
-        [noteData.identifier]: newNote
+        [noteIdentifier]: tempNote
       }));
 
-      // Reset states
+      try {
+        const newNote = await createNoteAPI(slugId, formData || noteData);
+        
+        // Check if the API response includes an ID
+        if (!newNote.id) {
+          console.log('API response missing note ID, fetching all notes...');
+          
+          // If ID is missing, fetch all notes to get the updated note with ID
+          const allNotes = await getAllNotes(slugId);
+          
+          // Find the newly created note by identifier
+          const createdNoteWithId = allNotes.find(note => note.identifier === noteIdentifier);
+          
+          if (createdNoteWithId && createdNoteWithId.id) {
+            console.log('Found note with ID after fetching all notes:', createdNoteWithId.id);
+            
+            // Update all notes in state
+            const notesMap = allNotes.reduce((acc, note) => ({
+              ...acc,
+              [note.identifier]: note
+            }), {});
+            
+            setNotes(notesMap);
+          } else {
+            console.error('Could not find created note with ID even after fetching all notes');
+          }
+        } else {
+          console.log('Note created successfully with ID:', newNote.id);
+          
+          // Update the note in state with the API response
+          setNotes(prev => {
+            console.log('Updating note in state with ID:', newNote.id);
+            return {
+              ...prev,
+              [noteIdentifier]: newNote
+            };
+          });
+        }
+      } catch (apiError) {
+        console.error('Error creating note via API:', apiError);
+        // Note: We already showed the temporary note in the UI, so we'll keep it
+        // and let the user try again or refresh if needed
+      }
+
+      // Reset UI states
       setSelectedText(null);
       setShowNotePopover(false);
+      setIsCreatingNote(false);
       lastSelectionRef.current = null;
 
       // Clear selection
       window.getSelection()?.removeAllRanges();
     } catch (error) {
-      console.error('Error creating note:', error);
+      console.error('Error in note creation flow:', error);
       throw error;
     }
   };
 
   const handleNoteUpdate = async (noteText: string, file?: File | null) => {
-    if (!editingNote || !slugId) {
-      console.error('Missing required data for note update');
+    if (!editingNote || !editingNote.id) {
+      console.error('Missing required data for note update (note ID required)');
       return;
     }
 
     try {
-      // Create a new object without file-related fields
-      const { identifier, section, selected_text, context } = editingNote;
-      const noteData: CreateNoteRequest = {
-        identifier,
+      console.log('Updating note:', { 
+        id: editingNote.id,
+        identifier: editingNote.identifier,
+        noteText, 
+        hasFile: !!file
+      });
+
+      // Updated to use the new API signature with note ID
+      const updatedNote = await updateNoteAPI(editingNote.id, {
         note: noteText,
-        section,
-        selected_text,
-        context
-      };
-
-      let formData: FormData | null = null;
-      if (file) {
-        formData = new FormData();
-        formData.append('note_file', file);
-        // Append other fields to FormData
-        Object.entries(noteData).forEach(([key, value]) => {
-          if (value !== undefined) {
-            formData!.append(key, typeof value === 'string' ? value : JSON.stringify(value));
-          }
-        });
-      }
-
-      const updatedNote = await updateNoteAPI(slugId, formData || noteData);
+        note_file: file || undefined
+      });
       
-      // Update notes state
-      setNotes(prev => ({
-        ...prev,
-        [editingNote.identifier]: updatedNote
-      }));
+      console.log('Note updated successfully with ID:', updatedNote.id);
+      
+      // Store the updated note data in state with the API response
+      setNotes(prev => {
+        return {
+          ...prev,
+          [editingNote.identifier]: updatedNote
+        };
+      });
 
-      // Reset states
+      // Reset UI states
       setEditingNote(null);
       setShowNotePopover(false);
       setIsCreatingNote(false);
@@ -1434,13 +1831,13 @@ export default function BaseTemplate({
 
   useEffect(() => {
     const handleTextSelection = () => {
-      if (isCreatingNote) return;
+      // Don't process text selection if we're already creating a note
+      if (isCreatingNote || showNotePopover || editingNote) return;
 
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed) {
-        if (!isCreatingNote) {
+        if (!isCreatingNote && !showNotePopover && !editingNote) {
           setSelectedText(null);
-          setShowNotePopover(false);
         }
         return;
       }
@@ -1448,14 +1845,31 @@ export default function BaseTemplate({
       const range = selection.getRangeAt(0);
       const text = range.toString().trim();
       
-      console.log('Selection detected:', { text });
+      console.log('Selection detected:', { text, isCreatingNote, showNotePopover });
       
       if (!text || text.length < MIN_SELECTION_LENGTH) {
         console.log('Text too short or empty');
-        if (!isCreatingNote) {
+        if (!isCreatingNote && !showNotePopover && !editingNote) {
           setSelectedText(null);
-          setShowNotePopover(false);
         }
+        return;
+      }
+
+      // Further checks to prevent selection while in the note creation UI
+      const target = selection.anchorNode?.parentElement;
+      if (target?.closest('.bg-white.rounded-lg.shadow-lg')) {
+        console.log('Selection inside note popover, ignoring');
+        return;
+      }
+      
+      // Skip selection within text inputs, textareas, and other form elements
+      if (
+        target?.tagName === 'INPUT' || 
+        target?.tagName === 'TEXTAREA' || 
+        target?.tagName === 'SELECT' ||
+        target?.isContentEditable
+      ) {
+        console.log('Selection inside form element, ignoring');
         return;
       }
 
@@ -1589,13 +2003,25 @@ export default function BaseTemplate({
 
     // Handle click outside
     const handleClickOutside = (e: MouseEvent) => {
+      // Skip if we're not showing a note popover
+      if (!showNotePopover) return;
+      
+      // If we're in note creation mode and the click was outside the popover
       if (
         popoverRef.current && 
-        !popoverRef.current.contains(e.target as Node) &&
-        !isCreatingNote
+        !popoverRef.current.contains(e.target as Node)
       ) {
-        setSelectedText(null);
-        setShowNotePopover(false);
+        // Only close if clicking on the backdrop (the semi-transparent overlay)
+        // The popover itself handles its own backdrop clicks
+        const isBackdropClick = (e.target as Element)?.classList?.contains('fixed') && 
+                               (e.target as Element)?.classList?.contains('inset-0');
+        
+        if (isBackdropClick) {
+          setSelectedText(null);
+          setShowNotePopover(false);
+          setIsCreatingNote(false);
+          setEditingNote(null);
+        }
       }
     };
 
@@ -1608,13 +2034,23 @@ export default function BaseTemplate({
       document.removeEventListener('keyup', handleSelectionEvent);
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [isCreatingNote]);
+  }, [isCreatingNote, showNotePopover, editingNote, slugId]);
 
   return (
     <div className="mx-auto max-w-4xl p-8">
       {/* Personal Info - Not Collapsible */}
-      <Card className="mb-8 section-card" data-section="personal_info">
-        <CardHeader>
+      <Card 
+        className={cn(
+          "mb-8 section-card", 
+          editMode[SECTIONS.PERSONAL_INFO] && "border-2 border-blue-200 bg-blue-50"
+        )} 
+        data-section="personal_info"
+      >
+        <CardHeader 
+          className={cn(
+            editMode[SECTIONS.PERSONAL_INFO] && "border-b border-blue-100"
+          )}
+        >
           <div className="flex items-center justify-between">
             <CardTitle>
               <EditableText 
@@ -1626,48 +2062,62 @@ export default function BaseTemplate({
             </CardTitle>
             {isEditable && (
               <Button 
-                variant="ghost" 
+                variant={editMode[SECTIONS.PERSONAL_INFO] ? "default" : "ghost"}
                 size="sm" 
+                className={cn(
+                  editMode[SECTIONS.PERSONAL_INFO] && "bg-blue-500 hover:bg-blue-600"
+                )}
                 onClick={() => toggleEditMode(SECTIONS.PERSONAL_INFO)}
               >
-                <Edit className="h-4 w-4" />
+                {editMode[SECTIONS.PERSONAL_INFO] ? (
+                  <>
+                    <Check className="h-4 w-4 mr-1" />
+                    <span className="text-xs">Editing</span>
+                  </>
+                ) : (
+                  <Edit className="h-4 w-4" />
+                )}
               </Button>
             )}
           </div>
           <div className="text-sm text-gray-500">
-            <p>
+            <div className="flex items-center gap-2">
               {resumeData.personal_info.email !== '-' && (
-                <>
+                <span className="inline-block">
                   <EditableText 
                     value={resumeData.personal_info.email} 
                     section={SECTIONS.PERSONAL_INFO} 
                     index={0} 
                     field="email" 
                   />
-                </>
+                </span>
               )}
               {resumeData.personal_info.contact_no !== '-' && resumeData.personal_info.contact_no && (
                 <>
                   {' • '}
-                  <EditableText 
-                    value={resumeData.personal_info.contact_no} 
-                    section={SECTIONS.PERSONAL_INFO} 
-                    index={0} 
-                    field="contact_no" 
-                  />
+                  <span className="inline-block">
+                    <EditableText 
+                      value={resumeData.personal_info.contact_no} 
+                      section={SECTIONS.PERSONAL_INFO} 
+                      index={0} 
+                      field="contact_no" 
+                    />
+                  </span>
                 </>
               )}
-            </p>
+            </div>
             {resumeData.personal_info.gender !== '-' && (
-              <p className="text-sm text-gray-500">
+              <div className="text-sm text-gray-500">
                 Gender: {' '}
-                <EditableText 
-                  value={resumeData.personal_info.gender} 
-                  section={SECTIONS.PERSONAL_INFO} 
-                  index={0} 
-                  field="gender" 
-                />
-              </p>
+                <span className="inline-block">
+                  <EditableText 
+                    value={resumeData.personal_info.gender} 
+                    section={SECTIONS.PERSONAL_INFO} 
+                    index={0} 
+                    field="gender" 
+                  />
+                </span>
+              </div>
             )}
             {renderSocialLinks()}
             {editMode[SECTIONS.PERSONAL_INFO] && isEditable && (
@@ -1707,7 +2157,14 @@ export default function BaseTemplate({
 
       {/* Skills */}
       {resumeData.skills?.length > 0 && (
-        <Card className={cn("mb-8 section-card", !openSections[UI_SECTIONS.SKILLS] && "!gap-0")} data-section="skills">
+        <Card 
+          className={cn(
+            "mb-8 section-card", 
+            !openSections[UI_SECTIONS.SKILLS] && "!gap-0",
+            editMode[SECTIONS.SKILLS] && "border-2 border-blue-200 bg-blue-50"
+          )} 
+          data-section="skills"
+        >
           <SectionHeader title="Skills" section={UI_SECTIONS.SKILLS} />
           <div className={cn(
             "grid transition-all duration-200",
@@ -1724,7 +2181,14 @@ export default function BaseTemplate({
 
       {/* Work Experience */}
       {resumeData.work_experience?.filter(exp => exp.company_name !== '').length > 0 && (
-        <Card className={cn("mb-8 section-card", !openSections[UI_SECTIONS.EXPERIENCE] && "!gap-0")} data-section="work_experience">
+        <Card 
+          className={cn(
+            "mb-8 section-card", 
+            !openSections[UI_SECTIONS.EXPERIENCE] && "!gap-0",
+            editMode[SECTIONS.WORK_EXPERIENCE] && "border-2 border-blue-200 bg-blue-50"
+          )} 
+          data-section="work_experience"
+        >
           <SectionHeader title="Work Experience" section={UI_SECTIONS.EXPERIENCE} />
           <div className={cn(
             "grid transition-all duration-200",
@@ -1751,8 +2215,8 @@ export default function BaseTemplate({
                           field="company_name" 
                         />
                       </h3>
-                      <p className="text-sm text-gray-500">
-                        <span data-field="job_title">
+                      <div className="text-sm text-gray-500 flex items-center gap-1">
+                        <span className="inline-block" data-field="job_title">
                           <EditableText 
                             value={exp.job_title} 
                             section={SECTIONS.WORK_EXPERIENCE} 
@@ -1760,8 +2224,8 @@ export default function BaseTemplate({
                             field="job_title" 
                           />
                         </span>
-                        {' • '}
-                        <span data-field="duration">
+                        <span className="mx-1">•</span>
+                        <span className="inline-block" data-field="duration">
                           <EditableText 
                             value={exp.duration} 
                             section={SECTIONS.WORK_EXPERIENCE} 
@@ -1769,7 +2233,7 @@ export default function BaseTemplate({
                             field="duration" 
                           />
                         </span>
-                      </p>
+                      </div>
                       {exp.key_responsbilities.length > 0 && (
                         <ul className="mt-2 list-disc pl-5">
                           {exp.key_responsbilities.map((resp, i) => (
@@ -1797,7 +2261,14 @@ export default function BaseTemplate({
 
       {/* Projects */}
       {resumeData.projects?.length > 0 && (
-        <Card className={cn("mb-8 section-card", !openSections[UI_SECTIONS.PROJECTS] && "!gap-0")} data-section="projects">
+        <Card 
+          className={cn(
+            "mb-8 section-card", 
+            !openSections[UI_SECTIONS.PROJECTS] && "!gap-0",
+            editMode[SECTIONS.PROJECTS] && "border-2 border-blue-200 bg-blue-50"
+          )} 
+          data-section="projects"
+        >
           <SectionHeader title="Projects" section={UI_SECTIONS.PROJECTS} />
           <div className={cn(
             "grid transition-all duration-200",
@@ -1815,7 +2286,7 @@ export default function BaseTemplate({
                     data-section={SECTIONS.PROJECTS}
                   >
                     <h3 className="font-semibold">
-                      <span data-field="title">
+                      <span className="inline-block" data-field="title">
                         <EditableText 
                           value={project.title} 
                           section={SECTIONS.PROJECTS} 
@@ -1824,8 +2295,8 @@ export default function BaseTemplate({
                         />
                       </span>
                     </h3>
-                    <p className="text-sm">
-                      <span data-field="description">
+                    <div className="text-sm">
+                      <span className="inline-block" data-field="description">
                         <EditableText 
                           value={project.description} 
                           section={SECTIONS.PROJECTS} 
@@ -1834,7 +2305,7 @@ export default function BaseTemplate({
                           isMultiline={true}
                         />
                       </span>
-                    </p>
+                    </div>
                     {project.skills_used && project.skills_used.length > 0 && (
                       <div className="mt-2 flex flex-wrap gap-2">
                         {project.skills_used.map((skill, i) => (
@@ -1868,7 +2339,14 @@ export default function BaseTemplate({
 
       {/* Education */}
       {resumeData.qualifications?.length > 0 && (
-        <Card className={cn("mb-8 section-card", !openSections[UI_SECTIONS.EDUCATION] && "!gap-0")} data-section="qualifications">
+        <Card 
+          className={cn(
+            "mb-8 section-card", 
+            !openSections[UI_SECTIONS.EDUCATION] && "!gap-0",
+            editMode[SECTIONS.QUALIFICATIONS] && "border-2 border-blue-200 bg-blue-50"
+          )} 
+          data-section="qualifications"
+        >
           <SectionHeader title="Education" section={UI_SECTIONS.EDUCATION} />
           <div className={cn(
             "grid transition-all duration-200",
@@ -1886,7 +2364,7 @@ export default function BaseTemplate({
                     data-section={SECTIONS.QUALIFICATIONS}
                   >
                     <h3 className="font-semibold">
-                      <span data-field="title">
+                      <span className="inline-block" data-field="title">
                         <EditableText 
                           value={qual.title} 
                           section={SECTIONS.QUALIFICATIONS} 
@@ -1895,8 +2373,8 @@ export default function BaseTemplate({
                         />
                       </span>
                     </h3>
-                    <p className="text-sm">
-                      <span data-field="description">
+                    <div className="text-sm">
+                      <span className="inline-block" data-field="description">
                         <EditableText 
                           value={qual.description} 
                           section={SECTIONS.QUALIFICATIONS} 
@@ -1905,7 +2383,7 @@ export default function BaseTemplate({
                           isMultiline={true}
                         />
                       </span>
-                    </p>
+                    </div>
                     {index < resumeData.qualifications.length - 1 && <Separator className="my-4" />}
                   </div>
                 ))}
